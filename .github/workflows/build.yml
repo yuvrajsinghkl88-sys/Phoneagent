@@ -1,0 +1,375 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project
+        run: |
+          mkdir -p PhoneAgent/app
+          cat > PhoneAgent/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.phoneagent"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.phoneagent"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          mkdir -p PhoneAgent/app/src/main
+          cat > PhoneAgent/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+              <application
+                  android:label="Phone Agent"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".AgentService"
+                      android:exported="false"
+                      android:label="Phone Agent"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p PhoneAgent/app/src/main/java/com/example/phoneagent
+          cat > PhoneAgent/app/src/main/java/com/example/phoneagent/AgentService.kt <<'EOF'
+          package com.example.phoneagent
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          class AgentService : AccessibilityService() {
+
+              companion object {
+                  const val MODEL = "claude-sonnet-5-5"
+                  const val MAX_STEPS = 25
+                  var instance: AgentService? = null
+                  var logger: ((String) -> Unit)? = null
+                  @Volatile var running = false
+                  @Volatile var stopRequested = false
+                  private const val SYSTEM = """You control an Android phone for the user by reading the screen and choosing ONE action per turn.
+          Reply with ONLY a JSON object, no other text. Actions:
+          {"action":"open_app","name":"YouTube"}
+          {"action":"click","index":N}
+          {"action":"type","index":N,"text":"..."}
+          {"action":"enter"}  (press the keyboard search/send key on the last typed field)
+          {"action":"scroll","direction":"down"|"up"}
+          {"action":"back"} {"action":"home"} {"action":"wait"}
+          {"action":"done","message":"short summary or question for the user"}
+          Screen lines look like: [index] "text" "description" flags. Indexes change every turn.
+          Rules: take the shortest path. Do exactly what the task says. If the task is unclear, risky beyond what was asked, or you are stuck, use done and explain."""
+              }
+
+              private val nodes = ArrayList<AccessibilityNodeInfo>()
+              private var lastEdit: AccessibilityNodeInfo? = null
+
+              override fun onServiceConnected() { instance = this }
+              override fun onUnbind(intent: Intent?): Boolean { instance = null; return super.onUnbind(intent) }
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              private fun log(s: String) = logger?.invoke(s)
+
+              fun runTask(task: String, apiKey: String) {
+                  if (running) { log("Already running"); return }
+                  if (task.isBlank() || apiKey.isBlank()) { log("Need a task and an API key"); return }
+                  running = true; stopRequested = false
+                  Thread {
+                      try {
+                          val messages = JSONArray()
+                          messages.put(msg("user", "Task: $task\n\nScreen:\n${dump()}"))
+                          for (step in 1..MAX_STEPS) {
+                              if (stopRequested) { log("Stopped."); break }
+                              val reply = callClaude(apiKey, messages)
+                              log("Step $step: $reply")
+                              messages.put(msg("assistant", reply))
+                              val a = try { JSONObject(reply.substring(reply.indexOf('{'), reply.lastIndexOf('}') + 1)) }
+                              catch (e: Exception) { log("Could not parse reply"); break }
+                              if (a.optString("action") == "done") { log("DONE: " + a.optString("message")); break }
+                              val result = execute(a)
+                              Thread.sleep(1500)
+                              trimOld(messages)
+                              messages.put(msg("user", "Result: $result\n\nScreen:\n${dump()}"))
+                              if (step == MAX_STEPS) log("Reached step limit.")
+                          }
+                      } catch (e: Exception) {
+                          log("Error: ${e.message}")
+                      } finally { running = false }
+                  }.start()
+              }
+
+              private fun msg(role: String, text: String) = JSONObject().put("role", role).put("content", text)
+
+              private fun trimOld(messages: JSONArray) {
+                  for (i in 0 until messages.length()) {
+                      val o = messages.getJSONObject(i)
+                      if (o.getString("role") == "user") {
+                          o.put("content", o.getString("content").substringBefore("\n\nScreen:") + "\n(old screen omitted)")
+                      }
+                  }
+              }
+
+              private fun callClaude(apiKey: String, messages: JSONArray): String {
+                  val body = JSONObject().put("model", MODEL).put("max_tokens", 300)
+                      .put("system", SYSTEM).put("messages", messages)
+                  val c = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"; c.doOutput = true
+                  c.setRequestProperty("x-api-key", apiKey)
+                  c.setRequestProperty("anthropic-version", "2023-06-01")
+                  c.setRequestProperty("content-type", "application/json")
+                  c.outputStream.use { it.write(body.toString().toByteArray()) }
+                  val stream = if (c.responseCode in 200..299) c.inputStream else c.errorStream
+                  val text = stream.bufferedReader().readText()
+                  if (c.responseCode !in 200..299) throw RuntimeException("API ${c.responseCode}: $text")
+                  return JSONObject(text).getJSONArray("content").getJSONObject(0).getString("text").trim()
+              }
+
+              private fun dump(): String {
+                  nodes.clear()
+                  val root = rootInActiveWindow ?: return "(no screen)"
+                  val sb = StringBuilder("app=${root.packageName}\n")
+                  fun walk(n: AccessibilityNodeInfo?) {
+                      if (n == null || nodes.size >= 150) return
+                      if (n.isVisibleToUser) {
+                          val t = n.text?.toString()?.take(60) ?: ""
+                          val d = n.contentDescription?.toString()?.take(60) ?: ""
+                          if (t.isNotEmpty() || d.isNotEmpty() || n.isClickable || n.isEditable || n.isScrollable) {
+                              val f = listOfNotNull(
+                                  if (n.isClickable) "click" else null,
+                                  if (n.isEditable) "edit" else null,
+                                  if (n.isScrollable) "scroll" else null
+                              ).joinToString(",")
+                              sb.append("[${nodes.size}] \"$t\" \"$d\" $f\n")
+                              nodes.add(n)
+                          }
+                      }
+                      for (i in 0 until n.childCount) walk(n.getChild(i))
+                  }
+                  walk(root)
+                  return sb.toString()
+              }
+
+              private fun execute(a: JSONObject): String {
+                  return try {
+                      when (a.optString("action")) {
+                          "open_app" -> openApp(a.optString("name"))
+                          "click" -> click(a.optInt("index", -1))
+                          "type" -> {
+                              val n = nodes.getOrNull(a.optInt("index", -1)) ?: return "no such index"
+                              n.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                              val args = Bundle().apply {
+                                  putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, a.optString("text"))
+                              }
+                              lastEdit = n
+                              if (n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) "typed" else "type failed"
+                          }
+                          "enter" -> {
+                              if (Build.VERSION.SDK_INT >= 30 && lastEdit != null &&
+                                  lastEdit!!.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)) "enter pressed"
+                              else "enter failed, try clicking the search/send button"
+                          }
+                          "scroll" -> {
+                              val n = nodes.firstOrNull { it.isScrollable } ?: return "nothing scrollable"
+                              val act = if (a.optString("direction") == "up") AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                              else AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+                              if (n.performAction(act)) "scrolled" else "scroll failed"
+                          }
+                          "back" -> { performGlobalAction(GLOBAL_ACTION_BACK); "back" }
+                          "home" -> { performGlobalAction(GLOBAL_ACTION_HOME); "home" }
+                          "wait" -> "waited"
+                          else -> "unknown action"
+                      }
+                  } catch (e: Exception) { "error: ${e.message}" }
+              }
+
+              private fun openApp(name: String): String {
+                  val pm = packageManager
+                  val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val match = pm.queryIntentActivities(intent, 0)
+                      .firstOrNull { it.loadLabel(pm).toString().contains(name, ignoreCase = true) }
+                      ?: return "app '$name' not found"
+                  val launch = pm.getLaunchIntentForPackage(match.activityInfo.packageName) ?: return "cannot launch"
+                  launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  startActivity(launch)
+                  return "opened ${match.loadLabel(pm)}"
+              }
+
+              private fun click(i: Int): String {
+                  val node = nodes.getOrNull(i) ?: return "no such index"
+                  var n: AccessibilityNodeInfo? = node
+                  while (n != null && !n.isClickable) n = n.parent
+                  if (n != null && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return "clicked"
+                  val r = Rect(); node.getBoundsInScreen(r)
+                  val p = Path().apply { moveTo(r.exactCenterX(), r.exactCenterY()) }
+                  dispatchGesture(GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(p, 0, 80)).build(), null, null)
+                  return "tapped by coordinates"
+              }
+          }
+          EOF
+          mkdir -p PhoneAgent/app/src/main/java/com/example/phoneagent
+          cat > PhoneAgent/app/src/main/java/com/example/phoneagent/MainActivity.kt <<'EOF'
+          package com.example.phoneagent
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.speech.RecognizerIntent
+          import android.text.InputType
+          import android.view.ViewGroup
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var cmd: EditText
+              private lateinit var key: EditText
+              private lateinit var logView: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("p", MODE_PRIVATE)
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 60, 40, 40) }
+
+                  key = EditText(this).apply {
+                      hint = "Anthropic API key"
+                      setText(prefs.getString("key", ""))
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  }
+                  cmd = EditText(this).apply { hint = "Tell your phone what to do..." }
+                  val enable = Button(this).apply {
+                      text = "1. Enable Accessibility (one time)"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  }
+                  val mic = Button(this).apply {
+                      text = "馃帳 Speak"
+                      setOnClickListener {
+                          val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                              .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          @Suppress("DEPRECATION") startActivityForResult(i, 1)
+                      }
+                  }
+                  val run = Button(this).apply {
+                      text = "2. Run"
+                      setOnClickListener {
+                          val svc = AgentService.instance
+                          if (svc == null) { toast("Enable Phone Agent in Accessibility settings first"); return@setOnClickListener }
+                          prefs.edit().putString("key", key.text.toString().trim()).apply()
+                          logView.text = ""
+                          AgentService.logger = { line -> runOnUiThread { logView.append(line + "\n\n") } }
+                          svc.runTask(cmd.text.toString(), key.text.toString().trim())
+                      }
+                  }
+                  val stop = Button(this).apply { text = "Stop"; setOnClickListener { AgentService.stopRequested = true } }
+                  logView = TextView(this)
+                  val scroll = ScrollView(this).apply { addView(logView) }
+
+                  listOf(key, cmd, enable, mic, run, stop).forEach { root.addView(it, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT) }
+                  root.addView(scroll, ViewGroup.LayoutParams.MATCH_PARENT, 0)
+                  (scroll.layoutParams as LinearLayout.LayoutParams).weight = 1f
+                  setContentView(root)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 1 && resultCode == RESULT_OK) {
+                      cmd.setText(data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull() ?: "")
+                  }
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+          }
+          EOF
+          mkdir -p PhoneAgent/app/src/main/res/values
+          cat > PhoneAgent/app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="service_desc">Lets Phone Agent read the screen and tap buttons to complete tasks you give it.</string>
+          </resources>
+          EOF
+          mkdir -p PhoneAgent/app/src/main/res/xml
+          cat > PhoneAgent/app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          EOF
+          mkdir -p PhoneAgent
+          cat > PhoneAgent/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          mkdir -p PhoneAgent
+          cat > PhoneAgent/settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "PhoneAgent"
+          include(":app")
+          EOF
+      - name: Build
+        run: |
+          cd PhoneAgent
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhoneAgent-apk
+          path: PhoneAgent/app/build/outputs/apk/debug/app-debug.apk
