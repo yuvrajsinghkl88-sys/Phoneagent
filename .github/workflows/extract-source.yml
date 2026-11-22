@@ -1,0 +1,30 @@
+name: Extract PhoneAgent Source
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract embedded project
+        run: |
+          awk -F"'" '/echo .*base64 -d > p.zip/ {print $2; exit}' .github/workflows/build.yml > encoded.txt
+
+          if [ ! -s encoded.txt ]; then
+            echo "Base64 source not found"
+            exit 1
+          fi
+
+          base64 -d encoded.txt > p.zip
+          unzip -q p.zip
+
+      - name: Upload extracted source
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhoneAgent-Original-Source
+          path: PhoneAgent/
