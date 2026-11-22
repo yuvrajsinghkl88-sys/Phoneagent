@@ -94,7 +94,7 @@ jobs:
           class AgentService : AccessibilityService() {
 
               companion object {
-                  const val MODEL = "claude-sonnet-5-5"
+                  const val MODEL = "gemini-2.5-flash"
                   const val MAX_STEPS = 25
                   var instance: AgentService? = null
                   var logger: ((String) -> Unit)? = null
@@ -133,7 +133,7 @@ jobs:
                           messages.put(msg("user", "Task: $task\n\nScreen:\n${dump()}"))
                           for (step in 1..MAX_STEPS) {
                               if (stopRequested) { log("Stopped."); break }
-                              val reply = callClaude(apiKey, messages)
+                              val reply = callGemini(apiKey, messages)
                               log("Step $step: $reply")
                               messages.put(msg("assistant", reply))
                               val a = try { JSONObject(reply.substring(reply.indexOf('{'), reply.lastIndexOf('}') + 1)) }
@@ -162,19 +162,32 @@ jobs:
                   }
               }
 
-              private fun callClaude(apiKey: String, messages: JSONArray): String {
-                  val body = JSONObject().put("model", MODEL).put("max_tokens", 300)
-                      .put("system", SYSTEM).put("messages", messages)
-                  val c = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+              private fun callGemini(apiKey: String, messages: JSONArray): String {
+                  val contents = JSONArray()
+                  for (i in 0 until messages.length()) {
+                      val m = messages.getJSONObject(i)
+                      val role = if (m.getString("role") == "assistant") "model" else "user"
+                      contents.put(JSONObject().put("role", role)
+                          .put("parts", JSONArray().put(JSONObject().put("text", m.getString("content")))))
+                  }
+                  val body = JSONObject()
+                      .put("system_instruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM))))
+                      .put("contents", contents)
+                      .put("generationConfig", JSONObject()
+                          .put("responseMimeType", "application/json")
+                          .put("maxOutputTokens", 1024)
+                          .put("thinkingConfig", JSONObject().put("thinkingBudget", 0)))
+                  val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent")
+                      .openConnection() as HttpURLConnection
                   c.requestMethod = "POST"; c.doOutput = true
-                  c.setRequestProperty("x-api-key", apiKey)
-                  c.setRequestProperty("anthropic-version", "2023-06-01")
+                  c.setRequestProperty("x-goog-api-key", apiKey)
                   c.setRequestProperty("content-type", "application/json")
                   c.outputStream.use { it.write(body.toString().toByteArray()) }
                   val stream = if (c.responseCode in 200..299) c.inputStream else c.errorStream
                   val text = stream.bufferedReader().readText()
-                  if (c.responseCode !in 200..299) throw RuntimeException("API ${c.responseCode}: $text")
-                  return JSONObject(text).getJSONArray("content").getJSONObject(0).getString("text").trim()
+                  if (c.responseCode !in 200..299) throw RuntimeException("API ${c.responseCode}: ${text.take(300)}")
+                  return JSONObject(text).getJSONArray("candidates").getJSONObject(0)
+                      .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text").trim()
               }
 
               private fun dump(): String {
@@ -284,7 +297,7 @@ jobs:
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 60, 40, 40) }
 
                   key = EditText(this).apply {
-                      hint = "Anthropic API key"
+                      hint = "Gemini API key"
                       setText(prefs.getString("key", ""))
                       inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                   }
@@ -294,7 +307,7 @@ jobs:
                       setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
                   }
                   val mic = Button(this).apply {
-                      text = "馃帳 Speak"
+                      text = "🎤 Speak"
                       setOnClickListener {
                           val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
                               .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -359,17 +372,4 @@ jobs:
           }
           EOF
           mkdir -p PhoneAgent
-          cat > PhoneAgent/settings.gradle.kts <<'EOF'
-          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
-          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
-          rootProject.name = "PhoneAgent"
-          include(":app")
-          EOF
-      - name: Build
-        run: |
-          cd PhoneAgent
-          gradle assembleDebug --no-daemon
-      - uses: actions/upload-artifact@v4
-        with:
-          name: PhoneAgent-apk
-          path: PhoneAgent/app/build/outputs/apk/debug/app-debug.apk
+          cat > PhoneAgent
