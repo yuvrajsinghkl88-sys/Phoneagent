@@ -33,7 +33,7 @@ jobs:
       - name: Extract Gemini source ZIP
         run: |
           mkdir -p "$RUNNER_TEMP/phoneagent"
-          unzip -q "$GITHUB_WORKSPACE/PhoneAgent-Final-Source.zip" \
+          unzip -q "$GITHUB_WORKSPACE/PhoneAgent-StepByStep-Source.zip" \
             -d "$RUNNER_TEMP/phoneagent"
 
           PROJECT_FILE=$(find "$RUNNER_TEMP/phoneagent" \
